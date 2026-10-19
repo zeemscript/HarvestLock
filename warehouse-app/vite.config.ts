@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
+import { VitePWA } from "vite-plugin-pwa";
 
 // base is only non-root in a combined deployment. Two of those exist:
 // Vercel (see /vercel-build.sh and /vercel.json at the repo root), where
@@ -27,7 +28,32 @@ function buildSha(): string | undefined {
 }
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [
+    react(),
+    // Issue #216: install-to-home-screen + offline-tolerant shell, same
+    // treatment as coop-pwa. Precaches the built app shell only -- API
+    // calls are never cached (live chain/DB state; a stale cache would be
+    // actively misleading). Scope/start_url derive from `base`
+    // automatically, don't hardcode "/".
+    VitePWA({
+      registerType: "autoUpdate",
+      manifest: {
+        name: "HarvestLock — Warehouse",
+        short_name: "HarvestLock Warehouse",
+        description: "Confirm deliveries and run warehouse-side commitment actions from the field, part-offline-tolerant for spotty connectivity.",
+        theme_color: "#0b120f",
+        background_color: "#0b120f",
+        display: "standalone",
+        icons: [{ src: "icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" }],
+      },
+      workbox: {
+        globPatterns: ["**/*.{js,css,html,png,svg}"],
+        // Same rationale as buyer-app: storybook reuses this vite config,
+        // its manager bundle exceeds the default 2 MiB precache ceiling.
+        maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
+      },
+    }),
+  ],
   define: {
     "import.meta.env.VITE_BUILD_SHA": JSON.stringify(buildSha()),
   },

@@ -84,11 +84,27 @@ export async function upsertCommitment(contractId: string, c: Commitment): Promi
   }
 }
 
+/** Default page size for the commitments list when the caller passes no (or an unusable) limit. */
+export const DEFAULT_PAGE_SIZE = 20;
+
+/**
+ * Hard ceiling on the commitments list's page size. The route clamps any
+ * larger requested limit down to this, so no request can ask the cache
+ * for an unbounded slice no matter what query string it sends — the exact
+ * failure mode issue #225 was filed against.
+ */
+export const MAX_PAGE_SIZE = 100;
+
 export async function listCommitments({ limit, offset }: { limit?: number; offset?: number } = {}): Promise<CommitmentRow[]> {
-  const limitNum = limit ?? 20;
+  const limitNum = limit ?? DEFAULT_PAGE_SIZE;
   const offsetNum = offset ?? 0;
+  // `id` tiebreak: created_at alone is not a stable sort key — every row
+  // upserted in the same transaction shares a now() timestamp, and with
+  // ties Postgres is free to return each page in a different order, which
+  // makes consecutive pages skip or duplicate rows. A unique column last
+  // makes the order total, so pages always partition the set exactly.
   const { rows } = await pool.query<CommitmentRow>(
-    `SELECT * FROM commitments ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+    `SELECT * FROM commitments ORDER BY created_at DESC, id LIMIT $1 OFFSET $2`,
     [limitNum, offsetNum],
   );
   return rows;

@@ -8,6 +8,10 @@ warehouse receipt attestation intake, plus SDP integration (deployed, not
 forked — PRD §17.1). None of that last group is built yet — see `HANDOFF.md`
 for what's real today versus still ahead.
 
+Every contract `Status` and `Error` variant a caller can see — a `status`
+field's value, or an `Error(Contract, #N)` rejection — is decoded into
+plain English in [`../docs/contract-glossary.md`](../docs/contract-glossary.md).
+
 ## Architecture: the API never holds a party's private key
 
 Every write (`lock`, `claim_advance_1`, `settle`, ...) is split into two
@@ -59,6 +63,11 @@ entries) with the same table and the same sign/finalize logic — neither
 `src/stellar/multiParty.ts`'s propose/finalize functions nor the sign
 route care how many pending entries a proposal has, they just iterate
 the array.
+
+A Mermaid sequence diagram of the full three-party `reassign_buyer` walk
+(propose → each other party signs → finalize → submit), with per-step
+file/line references and the enforced edge cases, is in
+[`docs/reassign-buyer-sequence.md`](./docs/reassign-buyer-sequence.md).
 
 1. **Propose** — `POST /commitments/:contractId/tx/cancel/propose { proposerPublicKey }`
    or `POST /commitments/:contractId/tx/reassign-buyer/propose { proposerPublicKey, newBuyer }`.
@@ -141,6 +150,10 @@ the system. `GET /parties/:address/standing` exposes the read side.
 
 ## Endpoints, as of this writing
 
+The OpenAPI 3.1 description is in [`openapi.yaml`](./openapi.yaml). It is
+checked against the route registrations in `src/server.ts`; update it in
+the same change whenever an endpoint or request/response shape changes.
+
 | Method | Path | What it does |
 |---|---|---|
 | GET | `/health` | Liveness check. |
@@ -164,7 +177,7 @@ the system. `GET /parties/:address/standing` exposes the read side.
 | GET | `/commitments/:contractId/oracle-rate` | A genuinely live cross-contract call to the configured Reflector oracle on every request, never cached. Fails (500, contract error propagated) if no oracle is configured, the oracle doesn't quote that asset, or the quote is older than the configured bound. See below. |
 | POST | `/transactions/submit` | Submits a signed envelope, polls for confirmation, optionally refreshes the Postgres cache (`refreshContractId`), marks a multisig proposal completed (`completeProposalId`), and/or persists a staged allocation ledger's phone numbers (`allocationContractId`/`allocationMembers`) now that the on-chain call is confirmed. |
 | GET | `/commitments/:contractId` | Live read straight from chain (source of truth), refreshes the cache as a side effect. Also applies any reputation consequence from a fresh transition into `Defaulted`/`Forfeited` — see above. |
-| GET | `/commitments` | Lists the Postgres-cached mirror — the only way to list commitments at all, since the chain has no such query. |
+| GET | `/commitments` | Lists the Postgres-cached mirror — the only way to list commitments at all, since the chain has no such query. Paginated: `?limit=&offset=`, default page size 20, limit clamped to 100 (`DEFAULT_PAGE_SIZE`/`MAX_PAGE_SIZE` in `src/db/commitments.ts`); unusable values fall back to the defaults rather than erroring. Response is a bare array — clients treat a full page as "maybe more", not "done". Ordered `created_at DESC, id`, so pages partition the set with no skipped or duplicated rows across page edges. |
 | GET | `/parties/:address/standing` | A party's current reputation: strike count, whether they're barred, and why. Returns a clean default (not 404) for an address with no history. |
 
 ### Shortfall/grade adjustment (PRD §7)
@@ -309,6 +322,18 @@ other deadline-triggered function (`settle`, `expire_remainder_window`,
 detail, including a documented, deliberate limitation: freezing `status`
 doesn't pause any other deadline already ticking on the commitment.
 
+## CORS
+
+The API does not reflect arbitrary browser `Origin` headers. Set
+`CORS_ORIGINS` to a comma-separated list of exact origins (scheme, host,
+and optional port; no paths or wildcards) when the frontend deployment
+domains are known. Until then, cross-origin browser access is disabled;
+same-origin requests and non-browser clients are unaffected. Local Vite
+development can opt in with an origin such as `http://localhost:5173`.
+
+CORS only controls whether browsers expose responses to scripts. It is not
+authentication or a substitute for the contract's signature checks.
+
 ## Rate limiting — and what a 429 actually looks like (for frontends/backoff)
 
 Every route is rate-limited globally, per client IP: **100 requests per
@@ -318,6 +343,20 @@ trip it). This section documents the *observed* wire behavior — verified
 by running the server and bursting past the limit with `curl`, not read
 off the plugin's docs — because three frontends poll this API and need to
 back off correctly instead of hammering it.
+
+The 100/minute value is an explicit initial budget for the current
+transaction flow. A single-signer transaction normally spends two API
+requests: build the unsigned XDR, then submit the wallet-signed XDR;
+wallet signing itself is local. A staged three-party transaction spends
+at most four: propose, collect two other parties' signatures, then submit.
+That leaves capacity for up to 25 staged transactions per minute before
+polling. Each active proposal's 10-second waiting-state poll costs six
+requests per minute, so the theoretical ceiling is lower when several
+flows are waiting at once. All callers sharing one egress IP (for example,
+users behind the same NAT) share this budget. This is a starting abuse
+control setting, not a measured production capacity claim; review it
+against pilot traffic before launch, and use a shared limiter store if
+multiple API instances need a coordinated per-IP limit.
 
 **Yes, a 429 carries `Retry-After`.** A request past the limit gets:
 
@@ -349,11 +388,9 @@ What a client should key off:
   every other error in this API (see `setErrorHandler` in
   `src/server.ts`) — no special-casing needed on the parse path.
 - **The limit is per client IP, shared across all routes** — it is not
-  per endpoint and not per frontend. A single frontend driving a
-  multi-step build/sign/submit flow plus the 10-second proposal-state
-  poll fits comfortably inside 100/min; three frontends from the same
-  NAT'd egress IP share one budget, which is the realistic case to
-  design backoff around. Don't retry a 429 immediately or on a fixed
+  per endpoint and not per frontend. Budget for transaction requests
+  and 10-second proposal polls together; multiple frontends from the
+  same NAT'd egress IP share one budget. Don't retry a 429 immediately or on a fixed
   short interval — wait the advertised `retry-after` (jitter optional
   but harmless).
 
@@ -372,17 +409,233 @@ above, so this can't quietly break again.
 
 ## Setup
 
+Requires Node.js 20.19+ (or 22.12+) and PostgreSQL. To run a local
+PostgreSQL 16 instance with the credentials used by `.env.example`:
+
+```sh
+docker run --name harvestlock-postgres \
+  -e POSTGRES_PASSWORD=harvestlock \
+  -e POSTGRES_DB=harvestlock \
+  -p 5432:5432 -d postgres:16
 ```
+
+Wait for PostgreSQL to accept connections before running the migration:
+`docker exec harvestlock-postgres pg_isready -U postgres -d harvestlock`.
+The container's default user is `postgres`, matching the example
+`DATABASE_URL`. If you already have PostgreSQL, create the `harvestlock`
+database and set `DATABASE_URL` in `.env` to match your local credentials.
+
+From the repository root:
+
+```
+cd api
 npm install
-cp .env.example .env   # fill in DATABASE_URL, ESCROW_WASM_HASH, DEPLOYER_SECRET_KEY
+cp .env.example .env
 npm run migrate
 npm run dev
 ```
+
+`DATABASE_URL` is required for the migration and normal API reads. The
+server can start without `ESCROW_WASM_HASH` and `DEPLOYER_SECRET_KEY`, but
+both are required by `POST /commitments/deploy`.
 
 `ESCROW_WASM_HASH` is the SHA-256 of the built escrow WASM — get it via
 `sha256sum` on `HarvestLock-Contracts/target/wasm32v1-none/release/harvestlock_escrow.wasm`,
 or cross-check against a deployed instance with
 `stellar contract fetch --id <CONTRACT_ID> --network testnet`.
+
+## Curl-only cookbook (nothing but curl, plus `stellar-cli` to sign)
+
+For an integrator who doesn't have Node tooling installed. Every **read**
+here is plain `curl`. Every **write** is: `curl` builds the unsigned
+transaction → the party's own key signs it → `curl` submits it. Signing uses
+[`stellar-cli`](https://developers.stellar.org/docs/tools/cli) — a
+standalone binary, not Node tooling — which is fine for the single-signer
+paths below. The one thing curl + `stellar-cli` alone *cannot* complete is a
+staged multi-party call (`cancel`, `reassign_buyer`, `resolve_dispute`),
+because each other party has to sign a single Soroban **auth entry**, not a
+whole envelope — that needs a wallet exposing `signAuthEntry` (Freighter) or
+the SDK; the per-step curl shapes are still shown in §7. Any rejection that
+comes back as `Error(Contract, #N)` is decoded in
+[`../docs/contract-glossary.md`](../docs/contract-glossary.md).
+
+Shell variables used throughout:
+
+```sh
+API=http://localhost:3000   # or wherever the API you're calling runs
+TOKEN=CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC  # testnet native XLM (Stellar Asset Contract)
+```
+
+`jq` is used below to pull fields out of responses; any JSON tool works — or
+just read the output by eye.
+
+### 1. Liveness
+
+```sh
+curl -s "$API/health"
+# {"ok":true,"checks":{"api":"ok","database":"ok"}}   (503 if the DB is down)
+```
+
+### 2. Three funded testnet identities
+
+```sh
+stellar keys generate buyer        --network testnet --fund
+stellar keys generate cooperative  --network testnet --fund
+stellar keys generate warehouse    --network testnet --fund
+
+BUYER=$(stellar keys address buyer)
+COOPERATIVE=$(stellar keys address cooperative)
+WAREHOUSE=$(stellar keys address warehouse)
+
+# for §7
+stellar keys generate incoming-buyer --network testnet --fund
+NEW_BUYER=$(stellar keys address incoming-buyer)
+```
+
+The `--fund` flag hits friendbot; the raw equivalent, if you already have
+G-addresses, is `curl -s "https://friendbot.stellar.org/?addr=$BUYER"`.
+Addresses must be *funded/created* accounts — an unfunded key fails
+on-chain with a storage error, not a signature error.
+
+### 3. Deploy a fresh escrow instance
+
+One contract instance = one commitment. Deployer-paid; no party auth.
+
+```sh
+CID=$(curl -s -X POST "$API/commitments/deploy" | jq -r .contractId)
+echo "$CID"
+```
+
+### 4. Initialize it (buyer signs)
+
+```sh
+curl -s -X POST "$API/commitments/$CID/tx/initialize" \
+  -H 'content-type: application/json' \
+  -d "{
+    \"buyer\": \"$BUYER\",
+    \"cooperative\": \"$COOPERATIVE\",
+    \"warehouseOperator\": \"$WAREHOUSE\",
+    \"token\": \"$TOKEN\",
+    \"totalAmount\": \"1000000000\",
+    \"advance1Bps\": 1500,
+    \"advance2Bps\": 2000,
+    \"claimWindowSecs\": \"86400\",
+    \"remainderWindowSecs\": \"604800\",
+    \"deliveryWindowSecs\": \"10368000\",
+    \"contractedQuantity\": 1000,
+    \"gradePriceBps\": [10000],
+    \"sourcePublicKey\": \"$BUYER\"
+  }" | jq -r .xdr > /tmp/init.xdr
+
+stellar tx sign --network testnet --sign-with-key buyer < /tmp/init.xdr > /tmp/init.signed.xdr
+
+curl -s -X POST "$API/transactions/submit" \
+  -H 'content-type: application/json' \
+  -d "{\"xdr\": \"$(cat /tmp/init.signed.xdr)\", \"refreshContractId\": \"$CID\"}"
+# {"status":"SUCCESS","hash":"..."}
+```
+
+Window bounds are enforced API-side before anything is built: `claimWindowSecs`
+1 h–90 d, `remainderWindowSecs` 1 h–30 d, `deliveryWindowSecs` 1 d–365 d.
+`oracleConfig` is optional — omit it for a plain deal (see the oracle
+section above).
+
+Built transactions carry a short time bound (60 s; 300 s for a finalized
+proposal), so sign and submit promptly, or rebuild the XDR.
+
+### 5. Lock the deposit (buyer signs)
+
+`lock` is one of the no-argument lifecycle methods, so it uses the generic
+`/tx/:method` route. Only the deposit (`advance1Bps + advance2Bps`) is
+escrowed here; the remainder is funded later via `fund_remainder`.
+
+```sh
+curl -s -X POST "$API/commitments/$CID/tx/lock" \
+  -H 'content-type: application/json' \
+  -d "{\"sourcePublicKey\": \"$BUYER\"}" | jq -r .xdr > /tmp/lock.xdr
+
+stellar tx sign --network testnet --sign-with-key buyer < /tmp/lock.xdr > /tmp/lock.signed.xdr
+
+curl -s -X POST "$API/transactions/submit" \
+  -H 'content-type: application/json' \
+  -d "{\"xdr\": \"$(cat /tmp/lock.signed.xdr)\", \"refreshContractId\": \"$CID\"}"
+```
+
+Other no-arg methods work the same way, e.g.
+`/tx/claim_advance_1` (sign with the cooperative key),
+`/tx/fund_remainder`, `/tx/settle` (permissionless). Argument-taking
+methods have their own routes: `/tx/confirm-delivery`,
+`/tx/flag-dispute`, `/tx/set-allocation`, `/tx/reassign-buyer`. Optional
+`oracleConfig` on `initialize` (for FX settlement) takes
+`{oracleContract, priceAsset, maxAgeSecs, denominatedAmount}` — see §6's
+read routes and the oracle section above.
+
+### 6. Read state (pure curl)
+
+```sh
+curl -s "$API/commitments/$CID" | jq          # live chain read (source of truth)
+curl -s "$API/commitments?limit=10" | jq      # Postgres-cached list
+curl -s "$API/commitments/$CID/allocation" | jq
+curl -s "$API/commitments/$CID/oracle-config" | jq
+curl -s "$API/parties/$BUYER/standing" | jq
+```
+
+After a successful lock, the live read's `status` is `Locked` (glossary:
+[`../docs/contract-glossary.md`](../docs/contract-glossary.md)).
+
+### 7. Staged multi-party calls — curl can start and finish, not sign the middle
+
+`reassign_buyer` (three parties), `cancel` (two), and `resolve_dispute`
+(three) are staged: a proposal row is created, each other party signs their
+own auth entry from their own wallet, then the proposer finalizes through
+the **existing** `/transactions/submit`. curl does the propose, the polling,
+and the finalize; the one `<signed entry XDR>` placeholder has to come from
+an auth-entry-capable wallet. Full diagram:
+[`docs/reassign-buyer-sequence.md`](./docs/reassign-buyer-sequence.md).
+
+```sh
+# Propose (only the current buyer may propose a reassignment)
+curl -s -X POST "$API/commitments/$CID/tx/reassign-buyer/propose" \
+  -H 'content-type: application/json' \
+  -d "{\"proposerPublicKey\": \"$BUYER\", \"newBuyer\": \"$NEW_BUYER\"}" > /tmp/proposal.json
+
+PROPOSAL_ID=$(jq -r .id /tmp/proposal.json)
+jq -r '.pending_entries[] | .address + " " + .entry_xdr' /tmp/proposal.json
+
+# Poll from any viewer (poll every ~10 s while waiting)
+curl -s "$API/commitments/$CID/tx/reassign-buyer/propose" | jq
+
+# Each pending signer: wallet signs ITS OWN entry_xdr (Freighter signAuthEntry,
+# not signTransaction), then posts it back
+curl -s -X POST "$API/commitments/$CID/tx/propose/$PROPOSAL_ID/sign" \
+  -H 'content-type: application/json' \
+  -d "{\"signerPublicKey\": \"$COOPERATIVE\", \"signedEntryXdr\": \"<signed entry XDR>\"}" | jq
+
+# Repeat for the incoming buyer. Once all entries are signed, status flips to
+# "ready" and ready_xdr appears:
+curl -s "$API/commitments/$CID/tx/reassign-buyer/propose" \
+  | jq -r .proposal.ready_xdr > /tmp/ready.xdr
+
+# The proposer signs ready_xdr classically and submits with
+# completeProposalId so the proposal stops showing as active:
+stellar tx sign --network testnet --sign-with-key buyer < /tmp/ready.xdr > /tmp/ready.signed.xdr
+curl -s -X POST "$API/transactions/submit" \
+  -H 'content-type: application/json' \
+  -d "{\"xdr\": \"$(cat /tmp/ready.signed.xdr)\", \"refreshContractId\": \"$CID\", \"completeProposalId\": \"$PROPOSAL_ID\"}"
+```
+
+### 8. What the common failures mean
+
+| Response | Meaning |
+|---|---|
+| `400` | Malformed contract ID / address, out-of-range window, unknown method — rejected before any network call. |
+| `403` | A business rule: wrong party proposing, or a barred buyer/cooperative on `initialize`. |
+| `429` | Rate limit (100 req/min per IP, global). Sleep the `retry-after` seconds — it's the time left in the current window, not a fixed cooldown. See the rate-limiting section above. |
+| `500` with `Error(Contract, #N)` | The contract rejected it (e.g. wrong status for that method). Find `N` in [`../docs/contract-glossary.md`](../docs/contract-glossary.md). |
+
+CORS is a browser concern only — curl doesn't enforce it, so a curl call
+succeeding says nothing about whether a browser frontend's origin is
+allow-listed (see the CORS section above).
 
 ## Testing
 
@@ -480,7 +733,10 @@ which the live end-to-end test caught as a failed assertion, not a crash.
   background poller yet, so the list view can go stale for commitments no
   one has viewed. Acceptable for now, worth revisiting once there's real
   usage. The reputation consequences above inherit the exact same gap,
-  for the exact same reason.
+  for the exact same reason. Revisited 18 Oct 2026 (#186) and kept as-is;
+  see `../docs/audits/2026-10-18-commitments-cache-refresh-revisit.md`
+  for the evidence, revisit triggers, and the pre-scoped smallest version
+  of the job.
 - The appeals process behind reputation's bar: the contact
   (`samuelojetunde898@gmail.com`) is documented on `site/roles.html`;
   there's no inbox automation or reinstatement workflow here yet,

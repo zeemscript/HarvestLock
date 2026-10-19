@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AllocationLedgerSection } from "./AllocationLedgerSection";
 import type { CommitmentDetail } from "../api";
@@ -75,23 +75,59 @@ beforeEach(() => {
 });
 
 describe("AllocationLedgerSection", () => {
-  it("renders nothing for a non-cooperative viewer when no ledger has been set", async () => {
+  it("shows the confirmed-unset state to a non-cooperative viewer without offering the form", async () => {
     fetchMock.mockResolvedValueOnce(allocationNotSetResponse());
-    const { container } = render(
+    render(
       <AllocationLedgerSection commitment={baseCommitment} contractId="CXXX" walletAddress={baseCommitment.buyer} />,
     );
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    expect(container).toBeEmptyDOMElement();
+    expect(await screen.findByText("No allocation ledger has been recorded yet.")).toBeInTheDocument();
+    expect(screen.queryByText("Record member allocation")).not.toBeInTheDocument();
   });
 
-  it("renders nothing once the commitment is past Draft and no ledger exists -- set_allocation is pre-lock only", async () => {
+  it("shows the confirmed-unset state past Draft without offering the pre-lock form", async () => {
     fetchMock.mockResolvedValueOnce(allocationNotSetResponse());
     const locked = { ...baseCommitment, status: "Locked" };
-    const { container } = render(
+    render(
       <AllocationLedgerSection commitment={locked} contractId="CXXX" walletAddress={baseCommitment.cooperative} />,
     );
-    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    expect(container).toBeEmptyDOMElement();
+    expect(await screen.findByText("No allocation ledger has been recorded yet.")).toBeInTheDocument();
+    expect(screen.queryByText("Record member allocation")).not.toBeInTheDocument();
+  });
+
+  it("shows a loading state while the ledger request is pending", () => {
+    fetchMock.mockReturnValueOnce(new Promise<Response>(() => {}));
+    render(
+      <AllocationLedgerSection commitment={baseCommitment} contractId="CXXX" walletAddress={baseCommitment.cooperative} />,
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("Loading allocation ledger");
+  });
+
+  it("shows a contextual read error and lets the viewer retry", async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    const user = userEvent.setup();
+    render(
+      <AllocationLedgerSection commitment={baseCommitment} contractId="CXXX" walletAddress={baseCommitment.cooperative} />,
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Unable to load allocation ledger for CXXX: Failed to fetch");
+    expect(screen.queryByText("Record member allocation")).not.toBeInTheDocument();
+
+    fetchMock.mockResolvedValueOnce(allocationNotSetResponse());
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Record member allocation")).toBeInTheDocument();
+  });
+
+  it("does not treat a malformed response as a confirmed empty ledger", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({}));
+    render(
+      <AllocationLedgerSection commitment={baseCommitment} contractId="CXXX" walletAddress={baseCommitment.cooperative} />,
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Invalid allocation ledger response for CXXX: expected a members array",
+    );
+    expect(screen.queryByText("No allocation ledger has been recorded yet.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Record member allocation")).not.toBeInTheDocument();
   });
 
   it("shows the record-allocation form for the cooperative pre-lock when no ledger has been set", async () => {

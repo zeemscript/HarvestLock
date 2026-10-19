@@ -2,6 +2,17 @@ import type { CommitmentSummary } from "../api";
 import { StatusBadge } from "./StatusBadge";
 import { AddressChip } from "./AddressChip";
 
+/*
+ * Loading/error/empty states (UX audit, #181):
+ *   • Empty     — renders the `empty-state` message when there are no
+ *     commitments yet ("Nothing to attest yet…").
+ *   • Loading/Error — not owned here; this component only receives the already
+ *     fetched list. App.tsx renders `loading-state` ("Loading commitments…")
+ *     while `listLoading` is true and the shared `error-banner` (with the
+ *     specific upstream message from api.ts's `get`, never a generic
+ *     "something went wrong") when `listError` is set.
+ */
+
 export function CommitmentList({
   commitments,
   onSelect,
