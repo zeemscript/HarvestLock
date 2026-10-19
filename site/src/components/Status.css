@@ -92,10 +92,16 @@
   font-size: 0.7rem;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: var(--bone);
+  color: var(--pine-text);
   background: var(--pine-soft);
   border: 1px solid var(--pine);
   border-radius: 999px;
+}
+
+.status-live-badge--stale {
+  color: var(--gold);
+  background: var(--void-raised);
+  border-color: var(--gold);
 }
 
 @media (max-width: 720px) {

@@ -94,6 +94,12 @@ describe("CommitmentDetail's pendingSummary (buyer-specific framing)", () => {
 });
 
 describe("CommitmentDetail's shared formatting", () => {
+  it("shows claim deadlines in UTC with an explicit timezone label", () => {
+    const commitment = { ...baseCommitment, advance1_deadline: "1798245397" };
+    render(<CommitmentDetail commitment={commitment} contractId="CXXX" {...noopProps} />);
+    expect(screen.getByText("26 Dec 2026, 00:36 UTC")).toBeInTheDocument();
+  });
+
   it("labels the buyer's own address distinctly", () => {
     render(<CommitmentDetail commitment={baseCommitment} contractId="CXXX" {...noopProps} />);
     expect(screen.getByText("Buyer (you)")).toBeInTheDocument();

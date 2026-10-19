@@ -1,4 +1,5 @@
 import type { QueuedClaim } from "../offlineQueue";
+import { AddressChip } from "./AddressChip";
 
 /**
  * Surfaces claims that got queued because the device had no network at
@@ -32,8 +33,16 @@ export function OfflineQueueBanner({
       <ul className="offline-queue-list">
         {queuedClaims.map((claim) => (
           <li key={claim.id}>
+            {/* AddressChip, not the raw ID: a contract ID is 56
+                characters with no break opportunity in it, and
+                `.contract-id` only has a rule under `.commitment-row`
+                and `.detail-header`, so here it was simply full-width
+                text. On a 360px screen that pushed Retry 264px off the
+                right edge -- the control was unreachable, not just
+                ugly. The chip truncates and keeps the full value in a
+                title tooltip. */}
             <span className="offline-queue-item-label">
-              Advance {claim.tranche} — <span className="contract-id">{claim.contractId}</span>
+              Advance {claim.tranche} — <AddressChip address={claim.contractId} />
             </span>
             <button
               className="action-button secondary"

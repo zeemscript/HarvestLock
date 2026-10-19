@@ -2,13 +2,28 @@
 
 Thanks for looking at this. Read this file, then [`HANDOFF.md`](./HANDOFF.md) for current state, before opening a PR — both are short and will save you from redoing work someone already thought through.
 
+New to the project or to Soroban? Follow the [first-PR walkthrough](./docs/first-pr-walkthrough.md) for a small, verified path from choosing an issue through opening a PR.
+
 ## Before you write any code
 
 1. Read [`docs/PRD.md`](./docs/PRD.md) — at least the sections relevant to what you're touching. This project has an unusual amount of "why," including a full audit trail of things earlier versions got wrong. If your PR contradicts something the PRD deliberately decided, either you've found a real problem (say so in the PR, don't just override it) or you've missed context (the PRD will usually have it).
 2. Check [`HANDOFF.md`](./HANDOFF.md) and, if you're touching the contract, [`HarvestLock-Contracts/HANDOFF.md`](https://github.com/Agrisettle/HarvestLock-Contracts/blob/main/HANDOFF.md) for the current real state of what you're about to work on. Don't trust a README's "status" line over these — HANDOFF.md is maintained to be the accurate one.
-3. Check [`TASKS.md`](./TASKS.md) — the current shared backlog. GitHub issues aren't being filed yet (a deliberate, current choice, not a gap); TASKS.md is where in-progress and planned work is tracked until that changes. Say what you're picking up before starting anything nontrivial, to avoid two people building the same thing.
+3. Check [`TASKS.md`](./TASKS.md) and the relevant GitHub issue. TASKS.md is the shared project backlog; issues can also contain scoped work and acceptance criteria. Say what you're picking up before starting anything nontrivial, to avoid two people building the same thing.
 
 ## Local setup
+
+### Pre-commit checks
+
+Enable the repository's pre-commit hook once per checkout:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook checks staged files for whitespace errors and runs the existing
+Oxlint command for any changed frontend workspace. Install that workspace's
+dependencies with `npm ci` before committing frontend changes. It does not
+rewrite files or add another formatter dependency.
 
 **Contracts** (Rust, Soroban) — see [`HarvestLock-Contracts/README.md`](https://github.com/Agrisettle/HarvestLock-Contracts/blob/main/README.md). Short version: `cargo test` needs only Rust; `stellar contract build`/deploy needs the Stellar CLI.
 
@@ -39,6 +54,10 @@ Both need `api/` running to show real data — see each app's `README.md`.
 ## Commit messages
 
 Conventional-commit-ish (`feat:`, `fix:`, `docs:`, `refactor:`) with a body explaining *why*, not just what — this repo's history is written to be read later, not just skimmed in a PR diff. Look at recent commits in any of the repos under [Agrisettle](https://github.com/Agrisettle) for the tone.
+
+## Releases
+
+The release workflow reads Conventional Commit messages on `main` and opens or updates a release pull request with the root `CHANGELOG.md` and project version. Review and merge that pull request to accept the generated changelog. This project-level version is separate from the independently versioned apps; the workflow does not publish packages or create GitHub releases.
 
 ## CI
 

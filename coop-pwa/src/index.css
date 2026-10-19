@@ -83,6 +83,12 @@ a {
   color: var(--bone-faint);
 }
 
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 main {
   flex: 1;
   padding: 24px;
@@ -227,11 +233,22 @@ main {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  /* Without wrapping, the label and the Retry button share one line that
+     can't shrink below the label's min-content width -- which is how the
+     raw contract ID this row used to print pushed Retry 264px off the
+     right edge of a 360px screen, i.e. completely unreachable. The label
+     is an AddressChip now, so this is belt-and-braces: any future label
+     long enough to crowd the button drops it to its own line instead of
+     off the screen. */
+  flex-wrap: wrap;
 }
 
 .offline-queue-item-label {
   font-size: 0.85rem;
   color: var(--bone);
+  /* A flex item defaults to min-width:auto, which refuses to shrink past
+     its longest word; 0 lets it give ground to the button beside it. */
+  min-width: 0;
 }
 
 .reassign-section {
@@ -338,6 +355,12 @@ table.allocation-table th {
   padding: 12px 16px;
   border-radius: 6px;
   font-size: 0.9rem;
+  /* API errors are surfaced verbatim (`api.ts`'s get/post throw
+     `${path} -> ${status}: ${body}`), and that path embeds a 56-character
+     contract ID with no spaces in it -- one unbreakable token. Measured at
+     a 360px viewport it ran ~380px past the right edge and dragged the
+     whole page into horizontal scroll, so the break has to be forced. */
+  overflow-wrap: anywhere;
 }
 
 .card {
@@ -422,7 +445,8 @@ table.allocation-table th {
 .badge[data-status="Locked"],
 .badge[data-status="Advance1Released"],
 .badge[data-status="CheckpointPassed"],
-.badge[data-status="Advance2Released"] {
+.badge[data-status="Advance2Released"],
+.badge[data-status="ReadyForDelivery"] {
   border-color: var(--gold);
   color: var(--gold-bright);
 }
@@ -435,6 +459,7 @@ table.allocation-table th {
 
 .badge[data-status="Cancelled"],
 .badge[data-status="Defaulted"],
+.badge[data-status="Forfeited"],
 .badge[data-status="Disputed"] {
   border-color: var(--signal);
   color: #ef9c8c;
@@ -447,6 +472,13 @@ table.allocation-table th {
   gap: 12px;
   margin-bottom: 16px;
   flex-wrap: wrap;
+}
+
+.section-title {
+  margin: 0;
+  font-family: var(--display);
+  font-weight: 600;
+  font-size: 1.1rem;
 }
 
 .detail-header .contract-id {
@@ -470,6 +502,18 @@ table.allocation-table th {
 
 .party-grid dd {
   margin: 0;
+}
+
+/* A table can't shrink below its min-content width, and this one's
+   columns hold real sentences ("window expired, reclaimable") plus a
+   full `toLocaleString()` timestamp -- measured at 385px for the buyer's
+   four columns and 453px for the cooperative's five, both wider than a
+   360px phone. Scrolling it inside its own box keeps every column
+   reachable instead of pushing the entire page sideways. `tabindex`
+   because a scroll container is otherwise unreachable by keyboard. */
+.tranches-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 table.tranches {
@@ -507,4 +551,59 @@ table.tranches th {
   font-size: 0.75rem;
   opacity: 0.5;
   font-family: monospace;
+}
+
+/* Mobile-width pass: a 360-400px Android viewport is at least as likely
+   as a desktop one for a buyer, cooperative lead or warehouse operator,
+   and this file had no media query at all before. Every value below was
+   measured in Chrome at 360px and 400px rather than guessed. */
+@media (max-width: 480px) {
+  .app-header,
+  main {
+    /* 24px side gutters cost 48px of a 360px screen. 16px is still a
+       comfortable margin and hands the content back 16px -- enough, with
+       the cell padding below, for most tranche tables to stop scrolling. */
+    padding: 16px;
+  }
+
+  main {
+    gap: 16px;
+  }
+
+  table.tranches {
+    font-size: 0.8rem;
+  }
+
+  table.tranches th,
+  table.tranches td {
+    padding: 8px 6px;
+  }
+
+  /* This app's table carries a fifth column the other two don't -- the
+     cooperative's Claim button -- so it needs the extra trim most. */
+  .claim-button {
+    padding: 6px 8px;
+  }
+
+  /* Two inputs and a Remove button sharing one 328px row leaves each
+     input about 110px, which cuts the "Phone number" and "Share (bps)"
+     placeholders off mid-word -- the field stops saying what it wants.
+     Letting the row wrap drops Remove onto its own line and gives the
+     two inputs ~160px each, enough for both placeholders in full. */
+  .allocation-row {
+    flex-wrap: wrap;
+  }
+
+  .allocation-row input {
+    flex: 1 1 140px;
+  }
+
+  /* 41x18px is too small to hit reliably with a thumb -- WCAG 2.5.8's
+     minimum is 24x24. Left compact on wider viewports, where the pointer
+     is a mouse and the row height matters more. */
+  .address-chip-copy {
+    min-height: 24px;
+    display: inline-flex;
+    align-items: center;
+  }
 }

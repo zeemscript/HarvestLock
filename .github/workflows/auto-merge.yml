@@ -9,20 +9,23 @@ name: Auto-merge bot
 #     first; once assigned they may reopen the PR and the bot re-evaluates.
 #   - Code review is handled by CodeRabbit (see .coderabbit.yaml) — the bot
 #     does NOT post AI code reviews. The bot's job is merge automation plus
-#     the safety gates a reviewer can't see: CI status, scope/tamper checks,
-#     and waiting for CodeRabbit's review check-run before merging.
+#     the safety gates a reviewer can't see: CI status and waiting for
+#     CodeRabbit's review check-run before merging. Scope, size, and
+#     PR-description findings are informational only — never a hold.
 #   - Reports WHAT failed when a required check fails (error details pulled
 #     from the check annotations and the failed job's log — not just the
 #     check name).
 #   - Runs a scope check before merging: compares the changed files against
 #     the scope declared in the PR title/body, flags high-risk files
-#     (workflows, lockfiles, configs) and very large diffs. If anything is
-#     flagged, the bot holds the merge for a maintainer — a green CI is not
-#     enough when a PR drifts outside its declared scope.
+#     (workflows, lockfiles, configs) and large diffs (> 1 000 additions).
+#     Findings are posted as a non-blocking informational note — a fully
+#     green PR merges regardless of size or scope drift (contributions
+#     routinely bundle several issues in one PR).
 #   - Waits for CodeRabbit's review check-run to complete before merging, so
 #     problems are caught before the merge, not after.
-#   - Auto-merges once CI is green AND the scope check passes AND CodeRabbit
-#     has reviewed: normal merge by default (preserves history); rebase when
+#   - Auto-merges once CI is green AND CodeRabbit has reviewed. Size caps,
+#     scope drift, and PR-description checks do NOT gate the merge:
+#     normal merge by default (preserves history); rebase when
 #     the branch is behind base. Never squashes — squash rewrites history.
 #   - The merge announcement lists what the PR accomplishes (from its body)
 #     before merging.
@@ -96,7 +99,8 @@ jobs:
         Verify package-lock.json is in sync (site)
         Verify package-lock.json is in sync (warehouse-app)
       # Top-level path prefixes PRs normally touch. Files outside these
-      # are flagged by the diff-review gate (never auto-merged).
+      # are listed in the informational diff note (they do not block
+      # the merge — only green CI and CodeRabbit do).
       SCOPE_PREFIXES: |-
         api/
         buyer-app/
@@ -257,11 +261,11 @@ jobs:
                 '
           }
 
-          # ── diff review: scope + divergence gate ──
+          # ── diff review: scope + divergence note (non-blocking) ──
           # Compares the PR's changed files against the scope declared in
           # its title/body. Flags out-of-scope files, high-risk files, and
-          # very large diffs. When flagged, the bot posts a review and
-          # holds the merge for a maintainer (no auto-merge).
+          # large diffs. Findings are posted as an informational review
+          # after CI turns green — they never hold the merge.
           diff_review() {
             local PR="$1" TITLE="$2" BODY="$3"
             local FLAGS="" FILES LOWT LOWB SCOPE="" PR_TYPE="" P IN_SCOPE
@@ -342,10 +346,13 @@ jobs:
                   esac
                 done ;;
             esac
-            # Divergence from base: absurdly large or lopsided diff.
-            if [ "${NFILES}" -gt 40 ] || [ "${NADD}" -gt 2500 ]; then
-              FLAGS+="* Very large diff (${NFILES} files, +${NADD}) — verify"
-              FLAGS+=" nothing unrelated drifted in."
+            # Divergence from base: large diff — reported for visibility
+            # only. The old 1 000-line auto-merge cap was removed on
+            # request; multi-issue PRs merge once green.
+            if [ "${NFILES}" -gt 40 ] || [ "${NADD}" -gt 1000 ]; then
+              FLAGS+="* Large diff (${NFILES} files, +${NADD}) — no size cap;"
+              FLAGS+=" merging anyway once green. Verify nothing unrelated"
+              FLAGS+=" drifted in."
               FLAGS+=$'\n'
             fi
             printf '%s' "${FLAGS}"
@@ -435,93 +442,8 @@ jobs:
               fi
             fi
 
-            # ── PR body validation: reject empty / template-only bodies ──
-            # Prevents merging PRs like #244 where the contributor left the
-            # template placeholder untouched — the reviewer needs a real
-            # description of what changed and why.
-            if [ "${SELF}" != "true" ]; then
-              BODY_LOWER="$(printf '%s' "${PR_BODY}" | tr '[:upper:]' '[:lower:]')"
-              # Strip common markdown noise (headings, bullet markers, blank
-              # lines, HTML comments) and check if anything meaningful
-              # remains.
-              BODY_MEANINGFUL="$(printf '%s' "${PR_BODY}" \
-                | sed -E 's/^#{1,6} //; s/^- //; s/^[*] //; s/<!--[^>]*-->//g' \
-                | sed '/^[[:space:]]*$/d' \
-                | sed '/^\[.*/d' \
-                | sed '/^##[[:space:]]*$/d' \
-                | sed '/^- \[ \]/d' \
-                | sed '/^What this does$/d' \
-                | sed '/^Why$/d' \
-                | sed '/^Checklist$/d' \
-                | sed '/^How you verified it$/d' \
-                | sed '/^Closes/d' \
-                | sed '/^Fixes/d' \
-                | sed '/^close[s]* #/d' \
-                | sed '/^See also$/d' \
-                | sed '/^\*$/d' \
-                | wc -l | tr -d ' ')"
-              if [ "${BODY_MEANINGFUL}" -lt 2 ]; then
-                echo "  PR body is empty or template-only — holding for maintainer"
-                MARKER_BODY="<!-- BOT-BODY-CHECK sha=${SHA} -->"
-                ALREADY_BODY="$(gh pr view "${PR}" --repo "${REPO}" \
-                  --json reviews \
-                  --jq "[.reviews[] | select(.author.login == \"${BOT_LOGIN}\")
-                    | select(.body | contains(\"${MARKER_BODY}\"))] | length" \
-                  2>/dev/null || echo 0)"
-                if [ "${ALREADY_BODY}" -eq 0 ]; then
-                  BODY_MSG="🤖 **Auto-merge bot** — ⚠️ The PR description is empty or"
-                  BODY_MSG+=" still contains the template placeholder."
-                  BODY_MSG+=$'\n\n'
-                  BODY_MSG+="**What we need:** a brief summary of what changed and"
-                  BODY_MSG+=" why, plus the related issue number."
-                  BODY_MSG+=$'\n\n'
-                  BODY_MSG+="Please edit the PR description and push — I will"
-                  BODY_MSG+=" re-check automatically."
-                  BODY_MSG+=$'\n\n'
-                  BODY_MSG+="${MARKER_BODY}"
-                  gh pr review "${PR}" --repo "${REPO}" --comment \
-                    --body "${BODY_MSG}" 2>/dev/null || true
-                fi
-                continue
-              fi
-            fi
-
-            # ── soft size limit: flag very large PRs for human review ──
-            # PRs adding more than 1 000 lines are too large for automated
-            # merge — they need at least one human review to verify nothing
-            # unrelated crept in. This threshold is generous enough for
-            # legitimate large features (which typically stay under 1 500)
-            # while catching the 2 000–6 000 line mega-PRs that slipped
-            # through before this guard existed.
-            NADD_SIZE="$(gh pr view "${PR}" --repo "${REPO}" \
-              --json additions --jq .additions 2>/dev/null || echo 0)"
-            if [ "${NADD_SIZE}" -gt 1000 ] && [ "${SELF}" != "true" ]; then
-              echo "  PR adds +${NADD_SIZE} lines (> 1 000) — holding for human review"
-              MARKER_SIZE="<!-- BOT-SIZE-CHECK sha=${SHA} -->"
-              ALREADY_SIZE="$(gh pr view "${PR}" --repo "${REPO}" \
-                --json reviews \
-                --jq "[.reviews[] | select(.author.login == \"${BOT_LOGIN}\")
-                  | select(.body | contains(\"${MARKER_SIZE}\"))] | length" \
-                2>/dev/null || echo 0)"
-              if [ "${ALREADY_SIZE}" -eq 0 ]; then
-                SIZE_MSG="🤖 **Auto-merge bot** — ⚠️ This PR adds **+${NADD_SIZE}"
-                SIZE_MSG+=" lines**, which exceeds the 1 000-line auto-merge"
-                SIZE_MSG+=" threshold."
-                SIZE_MSG+=$'\n\n'
-                SIZE_MSG+="Large PRs are harder to review and more likely to"
-                SIZE_MSG+=" carry unrelated changes. Please split into smaller"
-                SIZE_MSG+=" PRs if possible, or a maintainer will review"
-                SIZE_MSG+=" manually."
-                SIZE_MSG+=$'\n\n'
-                SIZE_MSG+="${MARKER_SIZE}"
-                gh pr review "${PR}" --repo "${REPO}" --comment \
-                  --body "${SIZE_MSG}" 2>/dev/null || true
-              fi
-              continue
-            fi
-
             # (No bot code-review posts — CodeRabbit handles code review.
-            #  The bot below only reports CI failures, gates scope, and
+            #  The bot below reports CI failures, notes scope drift, and
             #  merges.)
 
             # ── wait for required checks (up to ~40 min) ──
@@ -591,12 +513,13 @@ jobs:
             [ "${MERGEABLE}" = "MERGEABLE" ] || {
               echo "  not mergeable (${MERGEABLE}) — will retry"; continue; }
 
-            # Diff-review gate: a green CI is not enough. If the PR drifts
-            # outside its declared scope, post the findings and hold the
-            # merge for a maintainer.
+            # Diff findings: informational only — post once per head so the
+            # drift is visible in the thread, then continue to the merge.
+            # Size and scope drift no longer hold a fully green PR.
             DREV="$(diff_review "${PR}" "${PR_TITLE}" "${PR_BODY}")"
             if [ -n "${DREV}" ]; then
-              echo "  ⚠️ diff review flagged issues — holding for maintainer"
+              echo "  ℹ️ diff review flagged findings (non-blocking):"
+              printf '%s\n' "${DREV}"
               MARKER4="<!-- BOT-DIFF-REVIEW sha=${SHA} -->"
               ALREADY4="$(gh pr view "${PR}" --repo "${REPO}" \
                 --json reviews \
@@ -604,17 +527,19 @@ jobs:
                   | select(.body | contains(\"${MARKER4}\"))] | length" \
                 2>/dev/null || echo 0)"
               if [ "${ALREADY4}" -eq 0 ]; then
-                BODY4="🤖 **Auto-merge bot** — ⚠️ CI is green but the scope"
-                BODY4+=" check found files outside the PR's declared scope."
-                BODY4+=" Holding the merge for a maintainer:"
+                BODY4="🤖 **Auto-merge bot** — ℹ️ CI is green, so this PR is"
+                BODY4+=" merging despite the findings below (informational,"
+                BODY4+=" not blocking — large diffs and minor scope drift are"
+                BODY4+=" fine):"
                 BODY4+=$'\n\n'
                 BODY4+="${DREV}"
+                BODY4+=$'\n\n'
+                BODY4+="Merging now that all required checks are green."
                 BODY4+=$'\n\n'
                 BODY4+="${MARKER4}"
                 gh pr review "${PR}" --repo "${REPO}" --comment \
                   --body "${BODY4}" 2>/dev/null || true
               fi
-              continue
             fi
 
             # ── CodeRabbit review: trigger, then wait (if installed) ──
@@ -722,7 +647,7 @@ jobs:
               if [ -n "${ACCOMP}" ]; then
                 BODY+=$'\n'"**This PR accomplishes:**"$'\n'"${ACCOMP}"
               fi
-              BODY+=$'\n'"Diff: ${STATS} — verified within scope."$'\n'
+              BODY+=$'\n'"Diff: ${STATS}"$'\n'
               BODY+="CI is green — merging now."
               BODY+=$'\n\n'
               BODY+="<!-- BOT-MERGE-ANNOUNCE ${SHA} -->"

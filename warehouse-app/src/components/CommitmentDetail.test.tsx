@@ -117,3 +117,10 @@ describe("CommitmentDetail's grade schedule table", () => {
     expect(screen.getByText("Grade 2")).toBeInTheDocument();
   });
 });
+
+describe("CommitmentDetail's delivery deadline", () => {
+  it("shows the absolute deadline in UTC with an explicit timezone label", () => {
+    render(<CommitmentDetail commitment={baseCommitment} contractId="CXXX" {...noopProps} />);
+    expect(screen.getByText("26 Dec 2026, 00:36 UTC")).toBeInTheDocument();
+  });
+});

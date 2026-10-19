@@ -6,12 +6,18 @@ import { DisputeSection } from "./DisputeSection";
 import { AllocationLedgerSection } from "./AllocationLedgerSection";
 import { AddressChip } from "./AddressChip";
 
+const deadlineFormatter = new Intl.DateTimeFormat("en-GB", {
+  dateStyle: "medium",
+  timeStyle: "short",
+  timeZone: "UTC",
+});
+
 function formatDeadline(unixSecs: string): string {
   const n = Number(unixSecs);
   // The contract stores 0 as "unset" — release_advance_N hasn't run yet,
   // so no claim window exists to show. Not an error, not epoch-1970.
   if (n === 0) return "not yet opened";
-  return new Date(n * 1000).toLocaleString();
+  return `${deadlineFormatter.format(new Date(n * 1000))} UTC`;
 }
 
 function formatBps(bps: number): string {
@@ -127,57 +133,59 @@ export function CommitmentDetail({
 
       {claimError && <div className="error-banner">{claimError}</div>}
 
-      <table className="tranches">
-        <thead>
-          <tr>
-            <th>Tranche</th>
-            <th>Share</th>
-            <th>Claim deadline</th>
-            <th>State</th>
-            {isCooperative && <th>Action</th>}
-          </tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td>Advance 1</td>
-            <td>{formatBps(commitment.advance1_bps)}</td>
-            <td>{formatDeadline(commitment.advance1_deadline)}</td>
-            <td>{claimState(commitment.advance1_claimed, commitment.advance1_expired)}</td>
-            {isCooperative && (
-              <td>
-                {canClaim(commitment.advance1_deadline, commitment.advance1_claimed, commitment.advance1_expired) && (
-                  <button
-                    className="claim-button"
-                    onClick={() => onClaim(1)}
-                    disabled={claimingTranche !== null}
-                  >
-                    {claimingTranche === 1 ? "Claiming…" : "Claim"}
-                  </button>
-                )}
-              </td>
-            )}
-          </tr>
-          <tr>
-            <td>Advance 2</td>
-            <td>{formatBps(commitment.advance2_bps)}</td>
-            <td>{formatDeadline(commitment.advance2_deadline)}</td>
-            <td>{claimState(commitment.advance2_claimed, commitment.advance2_expired)}</td>
-            {isCooperative && (
-              <td>
-                {canClaim(commitment.advance2_deadline, commitment.advance2_claimed, commitment.advance2_expired) && (
-                  <button
-                    className="claim-button"
-                    onClick={() => onClaim(2)}
-                    disabled={claimingTranche !== null}
-                  >
-                    {claimingTranche === 2 ? "Claiming…" : "Claim"}
-                  </button>
-                )}
-              </td>
-            )}
-          </tr>
-        </tbody>
-      </table>
+      <div className="tranches-scroll" role="region" aria-label="Tranche schedule" tabIndex={0}>
+        <table className="tranches">
+          <thead>
+            <tr>
+              <th>Tranche</th>
+              <th>Share</th>
+              <th>Claim deadline</th>
+              <th>State</th>
+              {isCooperative && <th>Action</th>}
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Advance 1</td>
+              <td>{formatBps(commitment.advance1_bps)}</td>
+              <td>{formatDeadline(commitment.advance1_deadline)}</td>
+              <td>{claimState(commitment.advance1_claimed, commitment.advance1_expired)}</td>
+              {isCooperative && (
+                <td>
+                  {canClaim(commitment.advance1_deadline, commitment.advance1_claimed, commitment.advance1_expired) && (
+                    <button
+                      className="claim-button"
+                      onClick={() => onClaim(1)}
+                      disabled={claimingTranche !== null}
+                    >
+                      {claimingTranche === 1 ? "Claiming…" : "Claim"}
+                    </button>
+                  )}
+                </td>
+              )}
+            </tr>
+            <tr>
+              <td>Advance 2</td>
+              <td>{formatBps(commitment.advance2_bps)}</td>
+              <td>{formatDeadline(commitment.advance2_deadline)}</td>
+              <td>{claimState(commitment.advance2_claimed, commitment.advance2_expired)}</td>
+              {isCooperative && (
+                <td>
+                  {canClaim(commitment.advance2_deadline, commitment.advance2_claimed, commitment.advance2_expired) && (
+                    <button
+                      className="claim-button"
+                      onClick={() => onClaim(2)}
+                      disabled={claimingTranche !== null}
+                    >
+                      {claimingTranche === 2 ? "Claiming…" : "Claim"}
+                    </button>
+                  )}
+                </td>
+              )}
+            </tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
