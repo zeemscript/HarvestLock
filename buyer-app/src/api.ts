@@ -1,3 +1,5 @@
+import { withRetry } from "./retry";
+
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 
 /** Mirrors api/src/server.ts's serializeCommitment — every bigint on the
@@ -60,8 +62,20 @@ export interface CommitmentSummary {
   updated_at: string;
 }
 
+// The retry wraps only the fetch call, not the response handling below
+// it: a flaky connection failing a GET /commitments poll should silently
+// recover instead of needing a manual page refresh, but a real 4xx/5xx
+// (an actual server rejection, including a rate-limit 429 with its own
+// Retry-After contract — see api/README.md) must surface immediately,
+// not be replayed. `fetch` rejects only on transport-level failures, so
+// retrying around it retries exactly the transient case and nothing
+// else. A POST retry can't be certain whether the first attempt reached
+// the server; the bound (3 attempts, 500ms/1s backoff) keeps that window
+// small, and a duplicate `/tx/:method` build is harmless while a
+// duplicate `/transactions/submit` of the same signed envelope is
+// naturally rejected on its sequence number.
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_URL}${path}`);
+  const res = await withRetry(() => fetch(`${API_URL}${path}`));
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`${path} -> ${res.status}: ${body}`);
@@ -70,11 +84,13 @@ async function get<T>(path: string): Promise<T> {
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${API_URL}${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const res = await withRetry(() =>
+    fetch(`${API_URL}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
   if (!res.ok) {
     const responseBody = await res.text();
     throw new Error(`${path} -> ${res.status}: ${responseBody}`);
@@ -87,9 +103,18 @@ export function getCommitment(contractId: string): Promise<CommitmentDetail> {
   return get<CommitmentDetail>(`/commitments/${encodeURIComponent(contractId)}`);
 }
 
-/** Postgres-cached list — the only way to enumerate commitments, since the chain has no such query. */
-export function listCommitments(): Promise<CommitmentSummary[]> {
-  return get<CommitmentSummary[]>("/commitments");
+/**
+ * Postgres-cached list — the only way to enumerate commitments, since the
+ * chain has no such query. Pass `{ limit, offset }` to fetch one page of
+ * the list instead of the first page: the API (api/src/db/commitments.ts)
+ * defaults to 20 per page and clamps anything above its hard maximum, so
+ * callers should treat a page of exactly `limit` rows as "maybe more",
+ * not "done" — there is no total in the response shape.
+ */
+export function listCommitments(page?: { limit: number; offset: number }): Promise<CommitmentSummary[]> {
+  if (!page) return get<CommitmentSummary[]>("/commitments");
+  const query = new URLSearchParams({ limit: String(page.limit), offset: String(page.offset) });
+  return get<CommitmentSummary[]>(`/commitments?${query.toString()}`);
 }
 
 /** Builds unsigned XDR for a no-argument lifecycle method (`lock`, `settle`). The caller's wallet signs it next. */

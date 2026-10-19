@@ -44,7 +44,8 @@ export function AllocationLedgerSection({
   walletAddress: string | null;
 }) {
   const [members, setMembers] = useState<AllocationMember[] | null>(null);
-  const [loaded, setLoaded] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [readError, setReadError] = useState<string | null>(null);
   const [rows, setRows] = useState<MemberRow[]>([emptyRow()]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -53,30 +54,39 @@ export function AllocationLedgerSection({
   const isCooperative = walletAddress !== null && walletAddress === commitment.cooperative;
 
   const refresh = useCallback(() => {
+    setLoading(true);
+    setReadError(null);
     getAllocationLedger(contractId)
       .then((m) => setMembers(m))
-      .catch(() => {
-        // Best-effort, same convention as CancelSection/ReassignBuyerSection's
-        // background polls -- a failed read on mount shouldn't break the
-        // rest of the page for every viewer. A genuine failure here (vs.
-        // "never set yet", already turned into `null` by getAllocationLedger
-        // itself) just means the form shows again; set_allocation's own
-        // one-time contract guard is what actually prevents a double-set,
-        // not this read.
+      .catch((err: unknown) => {
+        setMembers(null);
+        setReadError(
+          `Unable to load allocation ledger for ${contractId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
       })
-      .finally(() => setLoaded(true));
+      .finally(() => setLoading(false));
   }, [contractId]);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
 
-  if (!loaded) return null;
-  // Array.isArray, not just `!== null` -- a malformed response (or a test
-  // double shaped for a different endpoint) should read as "nothing to
-  // show" here, not crash this component trying to .map() over it.
-  const hasLedger = Array.isArray(members);
-  if (!hasLedger && (!isCooperative || !settable)) return null;
+  if (loading) {
+    return (
+      <div className="allocation-section">
+        <div className="loading-state" role="status" aria-live="polite">Loading allocation ledger…</div>
+      </div>
+    );
+  }
+  if (readError) {
+    return (
+      <div className="allocation-section">
+        <div className="error-banner" role="alert">{readError}</div>
+        <button className="action-button secondary" type="button" onClick={refresh}>Retry</button>
+      </div>
+    );
+  }
+  const hasLedger = members !== null;
 
   function updateRow(i: number, patch: Partial<MemberRow>) {
     setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
@@ -129,6 +139,8 @@ export function AllocationLedgerSection({
     <div className="allocation-section">
       {error && <div className="error-banner">{error}</div>}
 
+      {!hasLedger && <p className="empty-state">No allocation ledger has been recorded yet.</p>}
+
       {hasLedger && (
         <table className="allocation-table">
           <caption>Allocation ledger</caption>
@@ -139,7 +151,7 @@ export function AllocationLedgerSection({
             </tr>
           </thead>
           <tbody>
-            {members!.map((m) => (
+            {members.map((m) => (
               <tr key={m.memberHash}>
                 <td className="allocation-hash">{m.memberHash.slice(0, 12)}…</td>
                 <td>{(m.shareBps / 100).toFixed(2)}%</td>

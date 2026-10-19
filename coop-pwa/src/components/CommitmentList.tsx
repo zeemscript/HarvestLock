@@ -5,9 +5,17 @@ import { AddressChip } from "./AddressChip";
 export function CommitmentList({
   commitments,
   onSelect,
+  hasMore = false,
+  loadingMore = false,
+  loadMoreError = null,
+  onLoadMore,
 }: {
   commitments: CommitmentSummary[];
   onSelect: (contractId: string) => void;
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  loadMoreError?: string | null;
+  onLoadMore?: () => void;
 }) {
   if (commitments.length === 0) {
     return (
@@ -27,6 +35,12 @@ export function CommitmentList({
           <StatusBadge status={c.status} />
         </button>
       ))}
+      {loadMoreError && <div className="error-banner" role="alert">{loadMoreError}</div>}
+      {hasMore && onLoadMore && (
+        <button className="refresh-button" onClick={onLoadMore} disabled={loadingMore}>
+          {loadingMore ? "Loading more…" : "Load more"}
+        </button>
+      )}
     </div>
   );
 }

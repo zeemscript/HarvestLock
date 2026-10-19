@@ -131,6 +131,39 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/commitments"));
   });
 
+  it("requests the next commitment page and appends its rows", async () => {
+    const firstPage = Array.from({ length: 20 }, (_, index) => ({
+      ...summary,
+      id: `row-${index + 1}`,
+      contract_id: `CONTRACT-${index + 1}`,
+    }));
+    const nextPage = [{ ...summary, id: "row-21", contract_id: "CONTRACT-21" }];
+    fetchMock.mockResolvedValueOnce(jsonResponse(firstPage));
+    fetchMock.mockResolvedValueOnce(jsonResponse(nextPage));
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByTitle("CONTRACT-1")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Load more" }));
+
+    expect(await screen.findByTitle("CONTRACT-21")).toBeInTheDocument();
+    expect(screen.getByTitle("CONTRACT-1")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenLastCalledWith(expect.stringMatching(/\/commitments\?limit=20&offset=20$/));
+    expect(screen.queryByRole("button", { name: "Load more" })).not.toBeInTheDocument();
+  });
+
+  it("shows loading and empty states while the commitments list is being fetched", async () => {
+    let resolveList!: (response: Response) => void;
+    fetchMock.mockReturnValueOnce(new Promise<Response>((resolve) => { resolveList = resolve; }));
+    render(<App />);
+
+    expect(screen.getByRole("status")).toHaveTextContent("Loading known commitments");
+    expect(screen.getByText("Look up a contract ID or select a known commitment to view its details.")).toBeInTheDocument();
+
+    resolveList(jsonResponse([]));
+    expect(await screen.findByText(/No commitments cached yet/)).toBeInTheDocument();
+  });
+
   it("shows an error banner, not a crash, when the list fetch fails", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ error: "db down" }, false));
     render(<App />);
@@ -166,6 +199,30 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "Look up" }));
 
     expect(await screen.findByText("15.00%")).toBeInTheDocument();
+  });
+
+  it("names the commitment when a detail lookup fails before reaching the API", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse([]));
+    fetchMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.type(screen.getByLabelText("Contract ID"), "CUNKNOWN");
+    await user.click(screen.getByRole("button", { name: "Look up" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Unable to load commitment CUNKNOWN: Failed to fetch");
+  });
+
+  it("shows a live loading state while a commitment lookup is pending", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse([]));
+    fetchMock.mockReturnValueOnce(new Promise<Response>(() => {}));
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.type(screen.getByLabelText("Contract ID"), "CUNKNOWN");
+    await user.click(screen.getByRole("button", { name: "Look up" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Reading commitment CUNKNOWN from chain");
   });
 
   it("connects a wallet and shows its truncated address instead of the connect button", async () => {
