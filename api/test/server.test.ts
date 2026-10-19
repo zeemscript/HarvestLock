@@ -1,9 +1,13 @@
 import "dotenv/config";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { FastifyInstance } from "fastify";
-import { Keypair } from "@stellar/stellar-sdk";
+import { Keypair, StrKey, Address, xdr } from "@stellar/stellar-sdk";
+import { randomBytes } from "node:crypto";
 import { buildServer } from "../src/server.js";
 import { recordBuyerDefault } from "../src/db/reputation.js";
+import { pool } from "../src/db/pool.js";
+import { MAX_PAGE_SIZE } from "../src/db/commitments.js";
+import { createProposal } from "../src/db/pendingMultisigProposals.js";
 
 /**
  * First HTTP-layer test coverage for server.ts — everything before this
@@ -26,10 +30,59 @@ import { recordBuyerDefault } from "../src/db/reputation.js";
 const FAKE_CONTRACT_ID = "CBCEGSHJYB7MKQ7BMWM62LXW4SV2NWNLEYJT6GLGZS3EIV7LO73AZPJI";
 const FAKE_PUBLIC_KEY = "GAJLI2MLTLHYPF4H2SCHQ7TJI6XHMHKIG6N5ZHONSTCKK4SWMGLDNLI5";
 
+/** Seeds `count` fake cached rows with the given contract_id prefix, so
+ * pagination tests can walk real pages through the real route. Values
+ * satisfy 001_init.sql's CHECKs but are otherwise arbitrary; created_at
+ * is left to its default, so every row of one INSERT shares a single
+ * now() — exactly the timestamp tie the route's ORDER BY ... id tiebreak
+ * exists to break. Callers clean up by the same prefix in a finally. */
+async function seedCommitments(prefix: string, count: number): Promise<void> {
+  await pool.query(
+    `INSERT INTO commitments
+       (contract_id, buyer_address, cooperative_address, warehouse_address, token_address,
+        total_amount, advance1_bps, advance2_bps, claim_window_secs, status)
+     SELECT p.prefix || i, 'GBUYER', 'GCOOP', 'GWH', 'GCACHE', 1000, 1500, 2000, 3600, 'Locked'
+     FROM (SELECT $1::text AS prefix) p, generate_series(1, $2::int) i`,
+    [prefix, count],
+  );
+}
+
+/**
+ * A syntactically valid base64 SorobanAuthorizationEntry — the sign route
+ * parses signedEntryXdr before looking the proposal up (issue #202), so a
+ * test that means to exercise "proposal not found" has to send something
+ * that parses. Nothing verifies its contents at this layer; a
+ * source-account-credential entry with an empty cancel() invocation is
+ * about as small as a valid one gets.
+ */
+function validAuthEntryXdr(): string {
+  const invocation = new xdr.SorobanAuthorizedInvocation({
+    function: xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(
+      new xdr.InvokeContractArgs({
+        contractAddress: new Address(FAKE_CONTRACT_ID).toScAddress(),
+        functionName: "cancel",
+        args: [],
+      }),
+    ),
+    subInvocations: [],
+  });
+  return new xdr.SorobanAuthorizationEntry({
+    credentials: xdr.SorobanCredentials.sorobanCredentialsSourceAccount(),
+    rootInvocation: invocation,
+  }).toXDR("base64");
+}
+
 let app: FastifyInstance;
 
 beforeAll(async () => {
-  app = await buildServer();
+  const configuredOrigins = process.env.CORS_ORIGINS;
+  process.env.CORS_ORIGINS = "http://example.test";
+  try {
+    app = await buildServer();
+  } finally {
+    if (configuredOrigins === undefined) delete process.env.CORS_ORIGINS;
+    else process.env.CORS_ORIGINS = configuredOrigins;
+  }
 });
 
 afterAll(async () => {
@@ -42,13 +95,13 @@ describe("server (HTTP layer)", () => {
     async () => {
       const res = await app.inject({ method: "GET", url: "/health" });
       expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ ok: true });
+      expect(res.json()).toEqual({ ok: true, checks: { api: "ok", database: "ok" } });
     },
     15_000,
   );
 
   it(
-    "sends CORS headers for a cross-origin request",
+    "allows only configured CORS origins",
     async () => {
       const res = await app.inject({
         method: "GET",
@@ -56,6 +109,13 @@ describe("server (HTTP layer)", () => {
         headers: { origin: "http://example.test" },
       });
       expect(res.headers["access-control-allow-origin"]).toBe("http://example.test");
+
+      const unlisted = await app.inject({
+        method: "GET",
+        url: "/health",
+        headers: { origin: "https://untrusted.example" },
+      });
+      expect(unlisted.headers["access-control-allow-origin"]).toBeUndefined();
     },
     15_000,
   );
@@ -106,6 +166,88 @@ describe("server (HTTP layer)", () => {
       expect(limited.json().length).toBeLessThanOrEqual(1);
     },
     15_000,
+  );
+
+  it(
+    "GET /commitments pages exactly at the page boundary (a full page, then one more)",
+    async () => {
+      // Issue #225's "done looks like": seed past one page and walk the
+      // boundary. Five rows: with limit=5 that is exactly one page, and
+      // with limit=2 it is one full page, a second full page, then one
+      // more — the two shapes a client's "load next page" logic turns on.
+      const prefix = "CTESTPAGE";
+      const total = 5;
+      await seedCommitments(prefix, total);
+      try {
+        // Exactly one page: the whole set fits, and the page after it is
+        // empty rather than an error or a repeat of the last page.
+        const onePage = await app.inject({
+          method: "GET",
+          url: `/commitments?limit=${total}&offset=0`,
+        });
+        expect(onePage.statusCode).toBe(200);
+        expect(onePage.json()).toHaveLength(total);
+
+        const pastTheEnd = await app.inject({
+          method: "GET",
+          url: `/commitments?limit=${total}&offset=${total}`,
+        });
+        expect(pastTheEnd.statusCode).toBe(200);
+        expect(pastTheEnd.json()).toHaveLength(0);
+
+        // One more than one page: 2 + 2 + 1 partitions the five rows —
+        // no gap, no duplicate across page edges. The dupes/skips this
+        // guards are real: every seeded row shares one created_at, and
+        // ORDER BY created_at alone let Postgres order ties differently
+        // per request.
+        const pages = [];
+        for (const offset of [0, 2, 4]) {
+          const res = await app.inject({
+            method: "GET",
+            url: `/commitments?limit=2&offset=${offset}`,
+          });
+          expect(res.statusCode).toBe(200);
+          pages.push(res.json() as { contract_id: string }[]);
+        }
+        expect(pages.map((p) => p.length)).toEqual([2, 2, 1]);
+
+        const walked = pages
+          .flat()
+          .map((c) => c.contract_id)
+          .filter((id) => id.startsWith(prefix));
+        expect(walked).toHaveLength(total);
+        expect(new Set(walked).size).toBe(total);
+      } finally {
+        await pool.query(`DELETE FROM commitments WHERE contract_id LIKE $1`, [`${prefix}%`]);
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "GET /commitments clamps an oversized limit instead of returning an unbounded page",
+    async () => {
+      // The other half of issue #225: falling back on *invalid* limits
+      // still left any *valid* limit free to ask for the whole cache
+      // (limit=1000000). Seed MAX_PAGE_SIZE + 5 rows and prove the route
+      // caps the page at MAX_PAGE_SIZE rather than passing the requested
+      // number through to Postgres.
+      const prefix = "CTESTCLAMP";
+      await seedCommitments(prefix, MAX_PAGE_SIZE + 5);
+      try {
+        const res = await app.inject({
+          method: "GET",
+          url: "/commitments?limit=1000000&offset=0",
+        });
+        expect(res.statusCode).toBe(200);
+        const rows = res.json() as { contract_id: string }[];
+        expect(rows).toHaveLength(MAX_PAGE_SIZE);
+        expect(rows.every((c) => c.contract_id.startsWith(prefix))).toBe(true);
+      } finally {
+        await pool.query(`DELETE FROM commitments WHERE contract_id LIKE $1`, [`${prefix}%`]);
+      }
+    },
+    30_000,
   );
 
   it(
@@ -940,7 +1082,7 @@ describe("server (HTTP layer)", () => {
       const res = await app.inject({
         method: "POST",
         url: `/commitments/${FAKE_CONTRACT_ID}/tx/propose/00000000-0000-0000-0000-000000000000/sign`,
-        payload: { signerPublicKey: FAKE_PUBLIC_KEY, signedEntryXdr: "AAAA" },
+        payload: { signerPublicKey: FAKE_PUBLIC_KEY, signedEntryXdr: validAuthEntryXdr() },
       });
       expect(res.statusCode).toBe(400);
       expect(res.json().message).toMatch(/no pending proposal/);
@@ -961,6 +1103,407 @@ describe("server (HTTP layer)", () => {
     },
     15_000,
   );
+
+  /**
+   * Issue #205 — bad-input audit of the dispute routes. The malformed
+   * contract ID case was already covered above; these lock in the same
+   * discipline for the two other ways a bad request used to fall through
+   * to an unhandled 500:
+   *
+   * 1. a bad/missing/non-string sourcePublicKey reached the SDK's
+   *    Keypair.fromPublicKey() (via server.getAccount()), which throws a
+   *    plain Error with no status code — 500;
+   * 2. a POST with no body at all left req.body undefined and crashed
+   *    reading a field off it — TypeError, also 500.
+   *
+   * Both are client-input errors, so both must be 400 with a message
+   * naming the field. The first sweep covers the routes the issue names
+   * (flag-dispute and the generic no-arg path resolve_dispute/
+   * expire_dispute_window go through) plus every other tx builder that
+   * takes a sourcePublicKey, per the issue's "applied everywhere it
+   * should be".
+   */
+  describe("dispute-route bad-input audit (400s, never unhandled 500s)", () => {
+    const tx = `/commitments/${FAKE_CONTRACT_ID}/tx`;
+
+    // One otherwise-valid payload per route; only sourcePublicKey varies.
+    it.each([
+      ["flag-dispute", `${tx}/flag-dispute`, { flagger: FAKE_PUBLIC_KEY }],
+      ["the generic no-arg route (resolve_dispute)", `${tx}/resolve_dispute`, {}],
+      ["the generic no-arg route (expire_dispute_window)", `${tx}/expire_dispute_window`, {}],
+      [
+        "initialize",
+        `${tx}/initialize`,
+        {
+          buyer: FAKE_PUBLIC_KEY,
+          cooperative: FAKE_PUBLIC_KEY,
+          warehouseOperator: FAKE_PUBLIC_KEY,
+          token: FAKE_CONTRACT_ID,
+          totalAmount: "1000000000",
+          advance1Bps: 1500,
+          advance2Bps: 2000,
+          claimWindowSecs: "3600",
+          remainderWindowSecs: "86400",
+          deliveryWindowSecs: "86400",
+          contractedQuantity: 1_000,
+          gradePriceBps: [10_000],
+        },
+      ],
+      ["confirm-delivery", `${tx}/confirm-delivery`, { deliveredQuantity: 500, gradeIndex: 0 }],
+      ["set-allocation", `${tx}/set-allocation`, { members: [{ phoneNumber: "+2348012345678", shareBps: 5_000 }] }],
+      ["reassign-buyer", `${tx}/reassign-buyer`, { newBuyer: FAKE_PUBLIC_KEY }],
+    ])("rejects a malformed sourcePublicKey on %s before touching the network", async (_route, url, payload) => {
+      const res = await app.inject({
+        method: "POST",
+        url,
+        payload: { ...payload, sourcePublicKey: "not-a-real-address" },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().message).toMatch(/sourcePublicKey is not a valid public key/);
+    });
+
+    // The same field, but absent or the wrong type rather than
+    // malformed — StrKey's validator answers false for both, so both
+    // must land on the same 400 rather than reach the SDK.
+    it.each([
+      ["a missing sourcePublicKey", { flagger: FAKE_PUBLIC_KEY }],
+      ["a non-string sourcePublicKey", { flagger: FAKE_PUBLIC_KEY, sourcePublicKey: 42 }],
+    ])("rejects %s on flag-dispute with 400, not 500", async (_label, payload) => {
+      const res = await app.inject({ method: "POST", url: `${tx}/flag-dispute`, payload });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().message).toMatch(/sourcePublicKey is not a valid public key/);
+    });
+
+    // No Content-Type header, no payload at all: Fastify leaves the body
+    // undefined. The preValidation normalization in server.ts turns that
+    // into an empty object so each route's own field validation answers
+    // (flag-dispute names `flagger`, the generic route names
+    // `sourcePublicKey`, propose names `proposerPublicKey`) — anything
+    // but the old TypeError 500.
+    it.each([
+      ["flag-dispute", `${tx}/flag-dispute`],
+      ["the generic no-arg route (resolve_dispute)", `${tx}/resolve_dispute`],
+      ["the generic no-arg route (expire_dispute_window)", `${tx}/expire_dispute_window`],
+      ["resolve-dispute/propose", `${tx}/resolve-dispute/propose`],
+    ])("answers a POST with no body at all on %s with 400, not a TypeError 500", async (_route, url) => {
+      const res = await app.inject({ method: "POST", url });
+      expect(res.statusCode).toBe(400);
+    });
+  });
+
+  /**
+   * Issue #201 — bad-input audit of POST /commitments/deploy and
+   * POST .../tx/initialize. Reproduced before the fix, all as opaque
+   * 500s leaking raw internals: `BigInt("abc")` for a non-numeric
+   * totalAmount (or missing entirely), NaN windows sailing past both
+   * range comparisons only to throw in `BigInt()` afterwards, negative
+   * or non-integer advance bps reaching nativeToScVal's u32 encoder,
+   * oversized quantities hitting its range guard, and oversized i128
+   * amounts knocking on `nativeToScVal`'s i128 bounds. Each is
+   * unambiguously caller input and must be a 400 naming the field.
+   *
+   * /commitments/deploy itself takes no caller-supplied values at all
+   * (no params, no body fields — the deployer key and WASM hash come
+   * from env), so its only client-input rejection is Fastify's own body
+   * parser before the handler ever runs; that's the one lock-in below.
+   */
+  describe("deploy/initialize bad-input audit (issue #201)", () => {
+    const validInitializeBody = () => ({
+      buyer: FAKE_PUBLIC_KEY,
+      cooperative: FAKE_PUBLIC_KEY,
+      warehouseOperator: FAKE_PUBLIC_KEY,
+      token: FAKE_CONTRACT_ID,
+      totalAmount: "1000000000",
+      advance1Bps: 1500,
+      advance2Bps: 2000,
+      ...validWindows,
+      contractedQuantity: 1_000,
+      gradePriceBps: [10_000],
+      sourcePublicKey: FAKE_PUBLIC_KEY,
+    });
+
+    it(
+      "rejects a malformed contract ID on initialize with 400, not an SDK 500",
+      async () => {
+        const res = await app.inject({
+          method: "POST",
+          url: "/commitments/not-a-real-contract-id/tx/initialize",
+          payload: validInitializeBody(),
+        });
+        expect(res.statusCode).toBe(400);
+        expect(res.json().message).toMatch(/not a valid contract ID/);
+      },
+      15_000,
+    );
+
+    it.each<{ label: string; overrides: Record<string, unknown>; pattern: RegExp }>([
+      // Windows: previously NaN (from a non-numeric or missing value)
+      // passed both `< MIN` and `> MAX`, then BigInt("abc") threw.
+      { label: "a non-numeric claimWindowSecs", overrides: { claimWindowSecs: "abc" }, pattern: /claimWindowSecs must be between/ },
+      { label: "a fractional claimWindowSecs", overrides: { claimWindowSecs: "3600.5" }, pattern: /claimWindowSecs must be between/ },
+      { label: "an object claimWindowSecs", overrides: { claimWindowSecs: { secs: 3600 } }, pattern: /claimWindowSecs must be between/ },
+      { label: "a missing remainderWindowSecs", overrides: { remainderWindowSecs: undefined }, pattern: /remainderWindowSecs must be between/ },
+      { label: "a non-numeric deliveryWindowSecs", overrides: { deliveryWindowSecs: "not-a-number" }, pattern: /deliveryWindowSecs must be between/ },
+      // totalAmount: previously BigInt() threw for missing/non-numeric,
+      // and nativeToScVal threw for anything past the i128 bound.
+      { label: "a missing totalAmount", overrides: { totalAmount: undefined }, pattern: /totalAmount must be an integer/ },
+      { label: "a non-numeric totalAmount", overrides: { totalAmount: "not-a-number" }, pattern: /totalAmount must be an integer/ },
+      { label: "a fractional totalAmount", overrides: { totalAmount: "1.5" }, pattern: /totalAmount must be an integer/ },
+      { label: "a zero totalAmount", overrides: { totalAmount: "0" }, pattern: /totalAmount must be positive/ },
+      { label: "a totalAmount beyond i128", overrides: { totalAmount: (2n ** 127n).toString() }, pattern: /out of range for a 128-bit integer/ },
+      // Advance bps: previously unvalidated, so strings, negatives and
+      // u32-overflow values all surfaced as raw encoder errors.
+      { label: "a non-numeric advance1Bps", overrides: { advance1Bps: "abc" }, pattern: /advance1Bps must be an integer between 0 and 10000/ },
+      { label: "a negative advance2Bps", overrides: { advance2Bps: -1 }, pattern: /advance2Bps must be an integer between 0 and 10000/ },
+      { label: "an over-10000 advance1Bps", overrides: { advance1Bps: 10_001 }, pattern: /advance1Bps must be an integer between 0 and 10000/ },
+      { label: "an oversized contractedQuantity", overrides: { contractedQuantity: 0x1_0000_0000 }, pattern: /contractedQuantity must be a positive integer/ },
+      // Oracle config: "1e21" is Number()-integer but BigInt() throws on
+      // it, and a denominatedAmount past i128 hit nativeToScVal.
+      {
+        label: "an oracleConfig maxAgeSecs that is not a safe integer",
+        overrides: {
+          oracleConfig: { oracleContract: FAKE_CONTRACT_ID, priceAsset: "NGN", maxAgeSecs: "1e21", denominatedAmount: "1000" },
+        },
+        pattern: /maxAgeSecs must be a positive integer/,
+      },
+      {
+        label: "an oracleConfig denominatedAmount beyond i128",
+        overrides: {
+          oracleConfig: {
+            oracleContract: FAKE_CONTRACT_ID,
+            priceAsset: "NGN",
+            maxAgeSecs: "3600",
+            denominatedAmount: (2n ** 127n).toString(),
+          },
+        },
+        pattern: /out of range for a 128-bit integer/,
+      },
+    ])("rejects $label on initialize with 400, not a 500", async ({ overrides, pattern }) => {
+      const res = await app.inject({
+        method: "POST",
+        url: `/commitments/${FAKE_CONTRACT_ID}/tx/initialize`,
+        payload: { ...validInitializeBody(), ...overrides },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toMatch(pattern);
+    });
+
+    it(
+      "rejects a malformed JSON body on /commitments/deploy with Fastify's own 400, not an unhandled 500",
+      async () => {
+        // The route has no fields of its own to reject, so the only
+        // caller-controlled rejection it can produce is the body
+        // parser's — asserted here so the whole #201 group is covered.
+        const res = await app.inject({
+          method: "POST",
+          url: "/commitments/deploy",
+          payload: "{ not json",
+          headers: { "content-type": "application/json" },
+        });
+        expect(res.statusCode).toBe(400);
+        expect(res.json().message).toMatch(/not valid JSON/);
+      },
+      15_000,
+    );
+  });
+
+  /**
+   * Issue #202 — bad-input audit of the propose/sign multi-party routes.
+   * The propose routes' contract-ID and proposer/newBuyer checks were
+   * already in place (covered by the tests above); the two gaps this
+   * locks in are both on the sign route:
+   *
+   * 1. `pending_multisig_proposals.id` is a Postgres UUID column, so a
+   *    non-UUID proposalId made the driver throw `invalid input syntax
+   *    for type uuid` — an opaque 500.
+   * 2. `signedEntryXdr` was never checked: a missing/non-string value
+   *    was persisted as-is (JSON.stringify drops `undefined`, so the
+   *    entry then read as "signed" with nothing in it) and a malformed
+   *    one was stored to explode much later inside
+   *    finalizeMultiPartyProposal's `fromXDR()` — a 500 on a different
+   *    request than the one that supplied the bad value.
+   */
+  describe("propose/sign multi-party bad-input audit (issue #202)", () => {
+    // A real pending row, so the signedEntryXdr cases exercise the path
+    // that used to accept the value; a nonexistent proposal would 400
+    // for an unrelated reason. Random contract ID, so this row can't
+    // leak into the "no active proposal" assertions above.
+    const proposalContractId = StrKey.encodeContract(randomBytes(32));
+    let proposalId: string;
+
+    beforeAll(async () => {
+      const row = await createProposal({
+        contractId: proposalContractId,
+        method: "cancel",
+        proposerAddress: FAKE_PUBLIC_KEY,
+        funcXdr: "AAAA",
+        sorobanDataXdr: "AAAA",
+        entries: [{ address: FAKE_PUBLIC_KEY, entryXdr: "AAAA", signedEntryXdr: null }],
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000),
+      });
+      proposalId = row.id;
+    });
+
+    afterAll(async () => {
+      await pool.query("DELETE FROM pending_multisig_proposals WHERE id = $1", [proposalId]);
+    });
+
+    it(
+      "rejects a malformed proposalId with 400, not a Postgres uuid 500",
+      async () => {
+        const res = await app.inject({
+          method: "POST",
+          url: `/commitments/${FAKE_CONTRACT_ID}/tx/propose/not-a-uuid/sign`,
+          payload: { signerPublicKey: FAKE_PUBLIC_KEY, signedEntryXdr: "AAAA" },
+        });
+        expect(res.statusCode).toBe(400);
+        expect(res.json().message).toMatch(/proposalId must be a UUID/);
+      },
+      15_000,
+    );
+
+    it.each<{ label: string; payload: Record<string, unknown>; pattern: RegExp }>([
+      {
+        label: "a missing signedEntryXdr",
+        payload: { signerPublicKey: FAKE_PUBLIC_KEY },
+        pattern: /signedEntryXdr must be a non-empty string/,
+      },
+      {
+        label: "a non-string signedEntryXdr",
+        payload: { signerPublicKey: FAKE_PUBLIC_KEY, signedEntryXdr: 42 },
+        pattern: /signedEntryXdr must be a non-empty string/,
+      },
+      {
+        label: "a malformed signedEntryXdr",
+        payload: { signerPublicKey: FAKE_PUBLIC_KEY, signedEntryXdr: "not-a-real-entry" },
+        pattern: /not a valid base64 Soroban authorization entry/,
+      },
+    ])("rejects $label on the sign route with 400, not an opaque 500", async ({ payload, pattern }) => {
+      const res = await app.inject({
+        method: "POST",
+        url: `/commitments/${proposalContractId}/tx/propose/${proposalId}/sign`,
+        payload,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().message).toMatch(pattern);
+    });
+
+    it.each<{ label: string; url: string }>([
+      { label: "cancel/propose", url: `/commitments/${FAKE_CONTRACT_ID}/tx/cancel/propose` },
+      { label: "reassign-buyer/propose", url: `/commitments/${FAKE_CONTRACT_ID}/tx/reassign-buyer/propose` },
+      { label: "the sign route", url: `/commitments/${FAKE_CONTRACT_ID}/tx/propose/00000000-0000-0000-0000-000000000000/sign` },
+    ])("answers a bodyless POST on $label with 400, not a TypeError 500", async ({ url }) => {
+      const res = await app.inject({ method: "POST", url });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it.each<{ label: string; url: string; payload: Record<string, unknown>; pattern: RegExp }>([
+      {
+        label: "a non-string proposerPublicKey on cancel/propose",
+        url: `/commitments/${FAKE_CONTRACT_ID}/tx/cancel/propose`,
+        payload: { proposerPublicKey: 42 },
+        pattern: /proposerPublicKey is not a valid public key/,
+      },
+      {
+        label: "an object newBuyer on reassign-buyer/propose",
+        url: `/commitments/${FAKE_CONTRACT_ID}/tx/reassign-buyer/propose`,
+        payload: { proposerPublicKey: FAKE_PUBLIC_KEY, newBuyer: {} },
+        pattern: /newBuyer is not a valid public key/,
+      },
+      {
+        label: "a non-string proposerPublicKey on resolve-dispute/propose",
+        url: `/commitments/${FAKE_CONTRACT_ID}/tx/resolve-dispute/propose`,
+        payload: { proposerPublicKey: 42 },
+        pattern: /proposerPublicKey is not a valid public key/,
+      },
+    ])("rejects $label with 400, not a 500", async ({ url, payload, pattern }) => {
+      const res = await app.inject({ method: "POST", url, payload });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().message).toMatch(pattern);
+    });
+  });
+
+  /**
+   * Issue #203 — bad-input audit of the allocation-ledger routes.
+   * GET .../allocation (malformed contract ID) and DELETE
+   * /allocation-members/:memberHash (malformed hash) already had 400
+   * coverage above; this locks in the one gap left on set-allocation:
+   * a JSON array element that isn't an object (null, a number, a bare
+   * string) crashed reading `.phoneNumber` off it with a TypeError — a
+   * 500 for what is plainly bad client input.
+   */
+  describe("allocation-ledger bad-input audit (issue #203)", () => {
+    const validAllocationBody = {
+      members: [{ phoneNumber: "+2348012345678", shareBps: 5_000 }],
+      sourcePublicKey: FAKE_PUBLIC_KEY,
+    };
+
+    it.each<{ label: string; members: unknown[]; pattern: RegExp }>([
+      { label: "a null member", members: [null], pattern: /non-empty phoneNumber/ },
+      { label: "a number member", members: [42], pattern: /non-empty phoneNumber/ },
+      { label: "a string member", members: ["+2348012345678"], pattern: /non-empty phoneNumber/ },
+      { label: "a member missing shareBps", members: [{ phoneNumber: "+2348012345678" }], pattern: /shareBps must be an integer/ },
+      {
+        label: "a member with a string shareBps",
+        members: [{ phoneNumber: "+2348012345678", shareBps: "5000" }],
+        pattern: /shareBps must be an integer/,
+      },
+    ])("rejects $label on set-allocation with 400, not a TypeError 500", async ({ members, pattern }) => {
+      const res = await app.inject({
+        method: "POST",
+        url: `/commitments/${FAKE_CONTRACT_ID}/tx/set-allocation`,
+        payload: { ...validAllocationBody, members },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error).toMatch(pattern);
+    });
+
+    it(
+      "rejects a non-array members value on set-allocation with 400",
+      async () => {
+        const res = await app.inject({
+          method: "POST",
+          url: `/commitments/${FAKE_CONTRACT_ID}/tx/set-allocation`,
+          payload: { members: "not-an-array", sourcePublicKey: FAKE_PUBLIC_KEY },
+        });
+        expect(res.statusCode).toBe(400);
+        expect(res.json().error).toMatch(/members must be a non-empty array/);
+      },
+      15_000,
+    );
+  });
+
+  /**
+   * Issue #204 — bad-input audit of the oracle read routes. Both routes'
+   * only caller-supplied value is the contractId path param, and
+   * requireValidContractId was already applied to each — no code fix
+   * needed, these tests just lock the 400 behavior in for the routes the
+   * issue names (same coverage the allocation/commitment reads already
+   * had). The G... case matters: a syntactically valid StrKey that is
+   * simply the wrong key type must still be a clear 400, not an SDK
+   * account-vs-contract decoding 500.
+   */
+  describe("oracle read bad-input audit (issue #204)", () => {
+    it.each(["oracle-config", "oracle-rate"])(
+      "rejects a malformed contract ID on GET .../%s with 400, not an SDK 500",
+      async (route) => {
+        const res = await app.inject({ method: "GET", url: `/commitments/not-a-real-contract-id/${route}` });
+        expect(res.statusCode).toBe(400);
+        expect(res.json().message).toMatch(/not a valid contract ID/);
+      },
+      15_000,
+    );
+
+    it.each(["oracle-config", "oracle-rate"])(
+      "rejects a G... account address in place of a contract ID on GET .../%s",
+      async (route) => {
+        const res = await app.inject({ method: "GET", url: `/commitments/${FAKE_PUBLIC_KEY}/${route}` });
+        expect(res.statusCode).toBe(400);
+        expect(res.json().message).toMatch(/not a valid contract ID/);
+      },
+      15_000,
+    );
+  });
 });
 
 /**

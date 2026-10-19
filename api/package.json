@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "migrate": "tsx src/db/migrate.ts",
     "migrate:prod": "node dist/db/migrate.js",
+    "load-test": "tsx scripts/load-test.ts",
     "key-recovery-exercise": "tsx scripts/key-recovery-exercise.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.test.json"
@@ -26,6 +27,7 @@
     "@types/pg": "^8.23.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
+    "vite": "^8.3.4",
     "vitest": "^5.0.3"
   }
 }

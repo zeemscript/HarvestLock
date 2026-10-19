@@ -173,8 +173,11 @@ export default function App() {
               {listLoading ? "Refreshing…" : "Refresh"}
             </button>
           </div>
+          {listLoading && <div className="loading-state">Loading commitments…</div>}
           {listError && <div className="error-banner">{listError}</div>}
-          {!listError && !listLoading && <CommitmentList commitments={commitments} onSelect={loadDetail} />}
+          {!listLoading && !listError && (
+            <CommitmentList commitments={commitments} onSelect={loadDetail} />
+          )}
         {hasMore && (
           <div className="load-more-container" style={{ marginTop: 16, textAlign: "center" }}>
             <button className="load-more-button" onClick={refreshList} disabled={listLoading}>

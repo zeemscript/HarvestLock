@@ -65,11 +65,11 @@ describe("CommitmentDetail", () => {
     expect(screen.getAllByText("not yet opened")).toHaveLength(2);
   });
 
-  it("formats a real deadline as a localized date, not the raw unix seconds", () => {
+  it("formats a real deadline in UTC with an explicit timezone label", () => {
     const commitment = { ...baseCommitment, advance1_deadline: "1788245397" };
     render(<CommitmentDetail commitment={commitment} contractId="CXXX" {...noopProps} />);
     expect(screen.queryByText("1788245397")).not.toBeInTheDocument();
-    expect(screen.getByText(new Date(1788245397 * 1000).toLocaleString())).toBeInTheDocument();
+    expect(screen.getByText("1 Sept 2026, 06:49 UTC")).toBeInTheDocument();
   });
 
   it("reflects claimed vs. expired vs. pending tranche state distinctly", () => {
